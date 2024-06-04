@@ -1,0 +1,67 @@
+trigger:
+  - develop # Trigger the pipeline on changes to the 'develop' branch
+
+variables:
+  solution: '**/*.sln'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+  sqlFolder: 'sql' # Path to the folder containing SQL scripts
+
+stages: 
+- name: Build
+  jobs:
+  - job: Build
+    pool:
+      vmImage: 'windows-latest'
+
+- name: Deploy
+  condition: and(succeeded(), not(startsWith(variables['Build.SourceBranch'], 'refs/pull/')))
+  jobs:
+  - deployment: DeployWebApp
+    displayName: Deploy Web App
+    environment: production
+    pool:
+      vmImage: 'windows-latest'
+
+  - job: UpdateDatabase
+    displayName: Update Database
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+    - checkout: self # Check out the repository
+      persistCredentials: true
+
+    - task: PowerShell@2
+      name: CheckSqlChanges
+      inputs:
+        targetType: 'inline'
+        script: |
+          $changedSqlFiles = git diff --name-only HEAD~1 HEAD -- '$(sqlFolder)/*.sql'
+          if ($changedSqlFiles) {
+            Write-Host "##vso[task.setvariable variable=changedSqlFiles]$changedSqlFiles"
+            Write-Host "##vso[task.setvariable variable=sqlChanges]true"
+          } else {
+            Write-Host "##vso[task.setvariable variable=sqlChanges]false"
+          }
+
+    - task: PowerShell@2
+      displayName: Set Connection String Variable
+      inputs:
+        targetType: 'inline'
+        script: |
+          $appSettingsPath = "$(Build.SourcesDirectory)/appsettings.json"
+          $connectionString = (Get-Content $appSettingsPath | ConvertFrom-Json).ConnectionStrings.DefaultConnection
+          Write-Host "##vso[task.setvariable variable=databaseConnectionString]$connectionString"
+
+
+    - task: PowerShell@2
+      displayName: Run Changed SQL Scripts
+      condition: eq(variables.sqlChanges, 'true')
+      inputs:
+        targetType: 'inline'
+        script: |
+          $changedSqlFiles = "$(changedSqlFiles)".Split("`n")
+          foreach ($file in $changedSqlFiles) {
+            $filePath = "$(Build.SourcesDirectory)/$file"
+            Write-Host "Running script: $filePath"
+            Invoke-Sqlcmd -ConnectionString $connectionString -InputFile $filePath
